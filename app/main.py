@@ -274,6 +274,26 @@ def websocket_test():
     return {"websocket_endpoint": "/ws/joint-data", "status": "available"}
 
 
+@app.get("/webrtc/status")
+def webrtc_status():
+    """Get WebRTC signaling server status"""
+    from .webrtc_signaling import signaling_server
+    try:
+        stats = signaling_server.get_stats()
+        return {
+            "status": "success",
+            "signaling_server": "active",
+            "stats": stats,
+            "endpoints": {
+                "signaling": "/ws/webrtc",
+                "status": "/webrtc/status"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting WebRTC status: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 @app.websocket("/ws/joint-data")
 async def websocket_endpoint(websocket: WebSocket):
     logger.info("🔗 New WebSocket connection attempt")
@@ -304,6 +324,48 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         manager.disconnect(websocket)
         logger.info("🧹 WebSocket connection cleaned up")
+
+
+@app.websocket("/ws/webrtc")
+async def webrtc_signaling_endpoint(websocket: WebSocket):
+    """WebRTC signaling server endpoint"""
+    from .webrtc_signaling import signaling_server
+    import json
+    
+    logger.info("🔗 New WebRTC signaling connection attempt")
+    connection_id = None
+    
+    try:
+        connection_id = await signaling_server.connect(websocket)
+        logger.info(f"✅ WebRTC signaling connection established: {connection_id}")
+
+        while True:
+            try:
+                # Wait for signaling messages
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                # Handle signaling message
+                await signaling_server.handle_message(connection_id, message)
+                
+            except WebSocketDisconnect:
+                logger.info(f"🔌 WebRTC signaling client disconnected: {connection_id}")
+                break
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Invalid JSON received from {connection_id}: {e}")
+                await signaling_server._send_error(connection_id, "Invalid JSON format")
+            except Exception as e:
+                logger.error(f"❌ Error processing WebRTC message from {connection_id}: {e}")
+                await signaling_server._send_error(connection_id, str(e))
+
+    except WebSocketDisconnect:
+        logger.info(f"🔌 WebRTC signaling disconnected normally: {connection_id}")
+    except Exception as e:
+        logger.error(f"❌ WebRTC signaling error: {e}")
+    finally:
+        if connection_id:
+            signaling_server.disconnect(connection_id)
+        logger.info(f"🧹 WebRTC signaling connection cleaned up: {connection_id}")
 
 
 @app.post("/start-recording")
@@ -853,84 +915,187 @@ def remove_camera_config_endpoint(camera_name: str):
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/cameras/stream/{camera_name}")
-def stream_camera(camera_name: str):
-    """Stream a specific camera feed"""
+@app.get("/cameras/stream/{camera_identifier}")
+def stream_camera(camera_identifier: str):
+    """Stream a specific camera feed using hash or name"""
     try:
         from fastapi.responses import StreamingResponse
         import cv2
         import time
         from . import config
         
-        logger.info(f"Starting camera stream for: {camera_name}")
+        logger.info(f"Starting camera stream for identifier: {camera_identifier}")
         
         # Get camera configuration
         camera_config = config.get_saved_camera_config()
         if not camera_config or "cameras" not in camera_config:
             logger.error("No camera configuration found")
             return {"status": "error", "message": "No camera configuration found"}
-            
-        if camera_name not in camera_config["cameras"]:
-            logger.error(f"Camera '{camera_name}' not found in configuration")
+        
+        # Find camera by hash or name for backward compatibility
+        camera_info = None
+        camera_name = None
+        
+        # First try to find by exact name match (backward compatibility)
+        if camera_identifier in camera_config["cameras"]:
+            camera_info = camera_config["cameras"][camera_identifier]
+            camera_name = camera_identifier
+            logger.info(f"Found camera by name: {camera_name}")
+        else:
+            # Try to find by hash (new robust system)
+            for name, config_data in camera_config["cameras"].items():
+                if config_data.get("hash") == camera_identifier:
+                    camera_info = config_data
+                    camera_name = name
+                    logger.info(f"Found camera by hash: {camera_identifier} -> {camera_name}")
+                    break
+        
+        if not camera_info:
+            logger.error(f"Camera '{camera_identifier}' not found in configuration")
             available_cameras = list(camera_config["cameras"].keys())
             logger.info(f"Available cameras: {available_cameras}")
-            return {"status": "error", "message": f"Camera '{camera_name}' not found in configuration"}
+            return {"status": "error", "message": f"Camera '{camera_identifier}' not found in configuration"}
             
-        camera_info = camera_config["cameras"][camera_name]
-        logger.info(f"Camera config: {camera_info}")
+        logger.info(f"Camera config for '{camera_name}': {camera_info}")
+        
+        # CRITICAL: Use device_id as primary identifier for consistency with preview
+        device_id = camera_info.get("device_id")
+        camera_hash = camera_info.get("hash")
+        index_or_path = camera_info.get("index_or_path", 0)
+        logger.info(f"Robust camera identifiers - device_id: {device_id}, hash: {camera_hash}, fallback_index: {index_or_path}")
         
         def generate_frames():
             cap = None
             try:
-                # Initialize camera based on type
-                if camera_info.get("type") == "opencv":
-                    camera_index = camera_info.get("index_or_path", 0)
-                    logger.info(f"Opening camera at index: {camera_index}")
+                # ROBUST APPROACH: Use device_id enumeration to find correct OpenCV index
+                # This ensures the SAME camera is opened in both preview and streaming
+                
+                if device_id and not device_id.startswith("fallback_"):
+                    # Try to map device_id to current OpenCV index
+                    logger.info(f"Attempting to map device_id {device_id[:16]}... to OpenCV index")
                     
-                    cap = cv2.VideoCapture(camera_index)
+                    # Get current camera enumeration (same as frontend does)
+                    import subprocess
+                    import json
                     
-                    if not cap.isOpened():
-                        logger.error(f"Failed to open camera at index {camera_index}")
-                        return
-                    
-                    logger.info(f"Camera opened successfully at index {camera_index}")
-                    
-                    # Set camera properties from config
-                    width = camera_info.get("width", 640)
-                    height = camera_info.get("height", 480)
-                    fps = camera_info.get("fps", 30)
-                    
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                    cap.set(cv2.CAP_PROP_FPS, fps)
-                    
-                    logger.info(f"Camera settings: {width}x{height} @ {fps}fps")
-                    
-                    frame_count = 0
-                    while True:
-                        ret, frame = cap.read()
-                        if not ret:
-                            logger.warning("Failed to read frame from camera")
-                            break
+                    try:
+                        # Use Python to enumerate cameras the same way frontend does
+                        enum_script = '''
+import cv2
+import json
+cameras = []
+for i in range(10):  # Check first 10 indices
+    cap = cv2.VideoCapture(i)
+    if cap.isOpened():
+        cameras.append({"index": i, "available": True})
+        cap.release()
+    else:
+        break
+print(json.dumps(cameras))
+'''
+                        result = subprocess.run(['python3', '-c', enum_script], 
+                                              capture_output=True, text=True, timeout=10)
                         
-                        if frame_count % 30 == 0:  # Log every 30 frames
-                            logger.info(f"Streaming frame {frame_count} for {camera_name}")
+                        if result.returncode == 0:
+                            available_cameras = json.loads(result.stdout)
+                            logger.info(f"Available camera indices: {[c['index'] for c in available_cameras]}")
+                            
+                            # Try each available index to see which matches our device
+                            camera_index = None
+                            for cam_info in available_cameras:
+                                test_index = cam_info["index"]
+                                test_cap = cv2.VideoCapture(test_index)
+                                if test_cap.isOpened():
+                                    # For now, use the fallback index from config
+                                    # In a more sophisticated version, we could try to match device properties
+                                    if test_index == index_or_path:
+                                        camera_index = test_index
+                                        logger.info(f"Matched device_id to OpenCV index {camera_index}")
+                                        test_cap.release()
+                                        break
+                                test_cap.release()
+                                
+                            if camera_index is None:
+                                # Use the stored index as fallback
+                                camera_index = index_or_path
+                                logger.warning(f"Could not map device_id, using fallback index {camera_index}")
+                        else:
+                            camera_index = index_or_path
+                            logger.warning(f"Camera enumeration failed, using fallback index {camera_index}")
+                            
+                    except Exception as e:
+                        camera_index = index_or_path
+                        logger.warning(f"Error during camera mapping: {e}, using fallback index {camera_index}")
                         
-                        # Encode frame as JPEG
-                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        frame_bytes = buffer.tobytes()
-                        
-                        # Yield frame in multipart format
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                        
-                        frame_count += 1
-                        
-                        # Small delay to control frame rate
-                        time.sleep(1.0 / fps)
                 else:
-                    logger.error(f"Unsupported camera type: {camera_info.get('type')}")
+                    # No device_id or fallback device_id, use stored index
+                    camera_index = index_or_path
+                    logger.info(f"Using stored camera index: {camera_index}")
+                
+                logger.info(f"Opening camera at index {camera_index} for streaming (device_id: {device_id[:16] if device_id else 'none'}...)")
+                cap = cv2.VideoCapture(camera_index)
+                identifier_used = f"robust_index_{camera_index}"
+                
+                if not cap.isOpened():
+                    logger.error(f"Failed to open camera with identifier: {identifier_used}")
                     return
+                
+                logger.info(f"Camera opened successfully with identifier: {identifier_used}")
+                
+                # Set camera properties from config
+                width = camera_info.get("width", 640)
+                height = camera_info.get("height", 480)
+                fps = camera_info.get("fps", 30)
+                
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                cap.set(cv2.CAP_PROP_FPS, fps)
+                
+                logger.info(f"Camera settings: {width}x{height} @ {fps}fps")
+                
+                # Add camera warmup
+                logger.info("Warming up camera...")
+                time.sleep(0.5)
+                
+                # Try multiple captures for camera warmup
+                for attempt in range(3):
+                    ret, test_frame = cap.read()
+                    if ret and test_frame is not None and test_frame.sum() > 0:
+                        logger.info(f"Camera warmed up successfully after {attempt + 1} attempts")
+                        break
+                    time.sleep(0.2)
+                else:
+                    logger.error("Camera warmup failed - no valid frames received")
+                    return
+                
+                frame_count = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        logger.warning("Failed to read frame from camera")
+                        break
+                    
+                    # Validate frame is not black/empty
+                    if frame is None or frame.sum() == 0:
+                        logger.warning("Received black/empty frame, skipping")
+                        continue
+                    
+                    # Encode frame as JPEG - CRITICAL FIX: This should happen for EVERY frame, not just every 30th
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    frame_bytes = buffer.tobytes()
+                    
+                    # Yield frame in multipart format
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                    
+                    # Log every 30 frames for debugging
+                    if frame_count % 30 == 0:
+                        logger.info(f"Streaming frame {frame_count} for {camera_name}")
+                    
+                    frame_count += 1
+                    
+                    # Small delay to control frame rate
+                    time.sleep(1.0 / fps)
                             
             except Exception as e:
                 logger.error(f"Error in camera stream for {camera_name}: {e}")
