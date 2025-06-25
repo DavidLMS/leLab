@@ -31,6 +31,60 @@ FOLLOWER_CONFIG_FILE = os.path.join(CONFIG_STORAGE_PATH, "follower_config.txt")
 CAMERA_CONFIG_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/camera_configs")
 CAMERA_CONFIG_FILE = os.path.join(CAMERA_CONFIG_PATH, "camera_config.json")
 
+# Define external URL configuration storage path
+EXTERNAL_URL_FILE = os.path.join(CONFIG_STORAGE_PATH, "external_url.txt")
+
+# Global variable to store current external URL
+_external_url = None
+
+def set_external_url(url: str):
+    """Set the external URL for QR code generation (ngrok, etc.)"""
+    global _external_url
+    _external_url = url.rstrip('/') if url else None
+    
+    # Ensure directory exists
+    os.makedirs(CONFIG_STORAGE_PATH, exist_ok=True)
+    
+    # Save to file for persistence
+    try:
+        with open(EXTERNAL_URL_FILE, 'w') as f:
+            f.write(url if url else '')
+        logger.info(f"External URL saved: {url}")
+    except Exception as e:
+        logger.error(f"Failed to save external URL: {e}")
+
+def get_external_url() -> str:
+    """Get the current external URL for QR code generation"""
+    global _external_url
+    
+    # Return cached value if available
+    if _external_url is not None:
+        return _external_url
+    
+    # Try to load from file
+    try:
+        if os.path.exists(EXTERNAL_URL_FILE):
+            with open(EXTERNAL_URL_FILE, 'r') as f:
+                url = f.read().strip()
+                _external_url = url if url else None
+                return _external_url
+    except Exception as e:
+        logger.error(f"Failed to load external URL: {e}")
+    
+    return None
+
+def clear_external_url():
+    """Clear the external URL configuration"""
+    global _external_url
+    _external_url = None
+    
+    try:
+        if os.path.exists(EXTERNAL_URL_FILE):
+            os.remove(EXTERNAL_URL_FILE)
+        logger.info("External URL configuration cleared")
+    except Exception as e:
+        logger.error(f"Failed to clear external URL: {e}")
+
 def setup_calibration_files(leader_config: str, follower_config: str):
     """Setup calibration files in the correct locations for teleoperation and recording"""
     # Extract config names from file paths (remove .json extension)

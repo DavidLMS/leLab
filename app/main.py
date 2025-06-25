@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
@@ -110,6 +110,9 @@ from .config import (
     save_robot_port,
     get_saved_robot_port,
     get_default_robot_port,
+    set_external_url,
+    get_external_url,
+    clear_external_url,
 )
 
 
@@ -248,6 +251,42 @@ def teleoperate_arm(request: TeleoperateRequest):
 def stop_teleoperation():
     """Stop the current teleoperation session"""
     return handle_stop_teleoperation()
+
+
+@app.post("/api/config/external-url")
+def configure_external_url(data: dict):
+    """Configure external URL for QR code generation (ngrok, tunneling, etc.)"""
+    try:
+        external_url = data.get("external_url", "").strip()
+        
+        if external_url:
+            # Validate URL format
+            if not external_url.startswith(("http://", "https://")):
+                return {"success": False, "error": "URL must start with http:// or https://"}
+            
+            set_external_url(external_url)
+            logger.info(f"✅ External URL configured: {external_url}")
+            return {"success": True, "external_url": external_url}
+        else:
+            # Clear external URL configuration
+            clear_external_url()
+            logger.info("✅ External URL configuration cleared")
+            return {"success": True, "external_url": None}
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to configure external URL: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/config/external-url")
+def get_current_external_url():
+    """Get the current external URL configuration"""
+    try:
+        external_url = get_external_url()
+        return {"success": True, "external_url": external_url}
+    except Exception as e:
+        logger.error(f"❌ Failed to get external URL: {e}")
+        return {"success": False, "error": str(e)}
 
 
 @app.get("/teleoperation-status")
@@ -913,6 +952,812 @@ def remove_camera_config_endpoint(camera_name: str):
     except Exception as e:
         logger.error(f"Error removing camera config: {e}")
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/remote_cam/{session_id}", response_class=HTMLResponse)
+async def external_camera_page(session_id: str):
+    """Serve the external camera page for WebRTC connection"""
+    
+    # HTML page for external camera capture
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en" class="dark">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>External Camera - LeLab</title>
+        <style>
+            :root {{
+                /* CSS Variables matching main frontend design */
+                --background: hsl(222.2 84% 4.9%);
+                --foreground: hsl(210 40% 98%);
+                --primary: hsl(210 40% 98%);
+                --secondary: hsl(217.2 32.6% 17.5%);
+                --muted: hsl(217.2 32.6% 17.5%);
+                --accent: hsl(217.2 32.6% 17.5%);
+                --destructive: hsl(0 84.2% 60.2%);
+                --border: hsl(217.2 32.6% 17.5%);
+                --card: hsl(222.2 84% 4.9%);
+                --card-foreground: hsl(210 40% 98%);
+                --radius: 0.5rem;
+            }}
+            
+            body {{
+                margin: 0;
+                padding: 1rem;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+                background: var(--background);
+                color: var(--foreground);
+                display: flex;
+                flex-direction: column;
+                min-height: 100vh;
+                line-height: 1.5;
+                -webkit-font-smoothing: antialiased;
+            }}
+            
+            .container {{
+                max-width: 1280px;
+                margin: 0 auto;
+                padding: 0 1rem;
+                width: 100%;
+            }}
+            
+            .header {{
+                text-align: center;
+                margin-bottom: 2rem;
+            }}
+            
+            .header h1 {{
+                font-size: 2rem;
+                font-weight: 700;
+                margin: 0;
+                color: var(--foreground);
+                letter-spacing: -0.025em;
+            }}
+            
+            .header .subtitle {{
+                font-size: 0.875rem;
+                color: hsl(215.4 16.3% 46.9%);
+                margin: 0.5rem 0 0 0;
+            }}
+            
+            .status {{
+                padding: 0.75rem 1rem;
+                border-radius: var(--radius);
+                margin-bottom: 1.5rem;
+                text-align: center;
+                font-weight: 500;
+                font-size: 0.875rem;
+                border: 1px solid transparent;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 0.5rem;
+            }}
+            
+            .status.connecting {{ 
+                background: hsl(47.9 95.8% 53.1% / 0.1); 
+                color: hsl(47.9 95.8% 53.1%); 
+                border-color: hsl(47.9 95.8% 53.1% / 0.2);
+            }}
+            
+            .status.connected {{ 
+                background: hsl(120 100% 25% / 0.1); 
+                color: hsl(120 100% 40%); 
+                border-color: hsl(120 100% 25% / 0.2);
+            }}
+            
+            .status.error {{ 
+                background: var(--destructive) / 0.1; 
+                color: var(--destructive); 
+                border-color: var(--destructive) / 0.2;
+            }}
+            
+            .status-icon {{
+                width: 1rem;
+                height: 1rem;
+                display: inline-block;
+                vertical-align: text-bottom;
+            }}
+            
+            .video-container {{
+                flex: 1;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: calc(var(--radius) * 1.5);
+                overflow: hidden;
+                position: relative;
+                min-height: 50vh;
+                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            }}
+            
+            video {{
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+            }}
+            
+            .controls {{
+                padding: 1.5rem 0;
+                display: flex;
+                gap: 0.75rem;
+                justify-content: center;
+                flex-wrap: wrap;
+            }}
+            
+            button {{
+                padding: 0.75rem 1.5rem;
+                border: 1px solid transparent;
+                border-radius: var(--radius);
+                font-size: 0.875rem;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.2s ease-in-out;
+                display: inline-flex;
+                align-items: center;
+                gap: 0.5rem;
+                min-width: auto;
+                text-decoration: none;
+                outline: none;
+                focus-visible: ring;
+            }}
+            
+            button:focus-visible {{
+                outline: 2px solid var(--primary);
+                outline-offset: 2px;
+            }}
+            
+            .start-btn {{
+                background: hsl(142.1 76.2% 36.3%);
+                color: hsl(355.7 100% 97.3%);
+                border-color: hsl(142.1 76.2% 36.3%);
+            }}
+            
+            .start-btn:hover {{
+                background: hsl(142.1 76.2% 32%);
+            }}
+            
+            .start-btn:disabled {{
+                opacity: 0.5;
+                cursor: not-allowed;
+            }}
+            
+            .stop-btn {{
+                background: var(--destructive);
+                color: hsl(355.7 100% 97.3%);
+                border-color: var(--destructive);
+            }}
+            
+            .stop-btn:hover {{
+                background: hsl(0 84.2% 55%);
+            }}
+            
+            .disconnect-btn {{
+                background: transparent;
+                color: var(--foreground);
+                border-color: var(--border);
+            }}
+            
+            .disconnect-btn:hover {{
+                background: var(--accent);
+                color: var(--foreground);
+            }}
+            
+            .info {{
+                background: var(--card);
+                border: 1px solid var(--border);
+                padding: 1rem;
+                border-radius: var(--radius);
+                margin-bottom: 1.5rem;
+                font-size: 0.875rem;
+                line-height: 1.5;
+            }}
+            
+            .info strong {{
+                color: var(--foreground);
+                font-weight: 600;
+            }}
+            
+            .camera-icon {{
+                width: 5rem;
+                height: 5rem;
+                margin: 1.5rem auto;
+                border: 2px solid var(--border);
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 2rem;
+                color: hsl(215.4 16.3% 46.9%);
+                background: var(--muted);
+            }}
+            
+            .spinner {{
+                display: inline-block;
+                width: 1rem;
+                height: 1rem;
+                border: 2px solid transparent;
+                border-top: 2px solid currentColor;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+            }}
+            
+            @keyframes spin {{
+                0% {{ transform: rotate(0deg); }}
+                100% {{ transform: rotate(360deg); }}
+            }}
+            
+            .pulse {{
+                animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }}
+            
+            @keyframes pulse {{
+                0%, 100% {{ opacity: 1; }}
+                50% {{ opacity: 0.5; }}
+            }}
+            
+            /* Live indicator */
+            .live-indicator {{
+                position: absolute;
+                top: 0.75rem;
+                left: 0.75rem;
+                display: flex;
+                align-items: center;
+                gap: 0.375rem;
+                background: rgba(0, 0, 0, 0.7);
+                padding: 0.375rem 0.75rem;
+                border-radius: var(--radius);
+                font-size: 0.75rem;
+                font-weight: 600;
+            }}
+            
+            .live-dot {{
+                width: 0.375rem;
+                height: 0.375rem;
+                background: hsl(120 100% 40%);
+                border-radius: 50%;
+            }}
+            
+            /* Responsive design */
+            @media (max-width: 640px) {{
+                body {{
+                    padding: 0.75rem;
+                }}
+                
+                .header h1 {{
+                    font-size: 1.75rem;
+                }}
+                
+                .controls {{
+                    flex-direction: column;
+                    align-items: center;
+                }}
+                
+                button {{
+                    width: 100%;
+                    max-width: 20rem;
+                    justify-content: center;
+                }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>External Camera</h1>
+                <div class="subtitle">LeLab External Camera Connection</div>
+            </div>
+            
+            <div id="status" class="status connecting">
+                <div class="spinner"></div>
+                Connecting to session...
+            </div>
+
+            <div class="controls">
+                <button id="startBtn" class="start-btn" onclick="startCamera()">
+                    <span>📹</span>
+                    Start Camera
+                </button>
+                <button id="stopBtn" class="stop-btn" onclick="stopCamera()" style="display:none;">
+                    <span>⏹️</span>
+                    Stop Camera
+                </button>
+                <button class="disconnect-btn" onclick="disconnect()">
+                    <span>🔌</span>
+                    Disconnect
+                </button>
+            </div>
+
+            <div class="video-container" id="videoContainer">
+                <div class="camera-icon">📹</div>
+            </div>
+            
+            <div class="info">
+                <strong>Instructions:</strong>
+                <br>• Allow camera access when prompted
+                <br>• Tap "Start Camera" to begin streaming
+                <br>• Keep this page open while using the robot
+            </div>
+        </div>
+        
+        
+        
+        
+        <script>
+            const sessionId = '{session_id}';
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const socket = new WebSocket(wsProtocol + '//' + window.location.host + '/ws/webrtc');
+            
+            let localStream = null;
+            let peerConnection = null;
+            let isStreaming = false;
+            
+            const statusEl = document.getElementById('status');
+            const videoContainer = document.getElementById('videoContainer');
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            // Enhanced WebRTC configuration with Android-specific fixes
+            const rtcConfig = {{
+                iceServers: [
+                    {{ urls: 'stun:stun.l.google.com:19302' }},
+                    {{ urls: 'stun:stun1.l.google.com:19302' }},
+                    {{ urls: 'stun:stun2.l.google.com:19302' }},
+                    {{ urls: 'stun:stun3.l.google.com:19302' }},
+                    {{ urls: 'stun:stun4.l.google.com:19302' }},
+                    // Additional STUN servers for Android compatibility
+                    {{ urls: 'stun:stun.cloudflare.com:3478' }},
+                    {{ urls: 'stun:stun.services.mozilla.com' }}
+                ],
+                iceCandidatePoolSize: 10,
+                bundlePolicy: 'max-bundle',
+                rtcpMuxPolicy: 'require',
+                // Android-specific settings
+                iceTransportPolicy: 'all',
+                certificates: undefined  // Let browser handle certificates
+            }};
+            
+            function updateStatus(message, type = 'connecting') {{
+                statusEl.className = `status ${{type}}`;
+                
+                // Clear existing content and add appropriate icon
+                statusEl.innerHTML = '';
+                
+                if (type === 'connecting') {{
+                    const spinner = document.createElement('div');
+                    spinner.className = 'spinner';
+                    statusEl.appendChild(spinner);
+                    statusEl.appendChild(document.createTextNode(message));
+                }} else if (type === 'connected') {{
+                    const checkIcon = document.createElement('span');
+                    checkIcon.textContent = '✅';
+                    statusEl.appendChild(checkIcon);
+                    statusEl.appendChild(document.createTextNode(' ' + message));
+                }} else if (type === 'error') {{
+                    const errorIcon = document.createElement('span');
+                    errorIcon.textContent = '❌';
+                    statusEl.appendChild(errorIcon);
+                    statusEl.appendChild(document.createTextNode(' ' + message));
+                }} else {{
+                    statusEl.textContent = message;
+                }}
+            }}
+            
+            // WebSocket events
+            socket.onopen = () => {{
+                console.log('🔗 Connected to signaling server');
+                console.log('📱 Session details:', {{
+                    sessionId: sessionId,
+                    timestamp: new Date().toISOString(),
+                    userAgent: navigator.userAgent,
+                    platform: navigator.platform,
+                    connectionType: navigator.connection ? navigator.connection.effectiveType : 'unknown'
+                }});
+                updateStatus('Connected! Joining session...', 'connecting');
+                socket.send(JSON.stringify({{
+                    type: 'join-session',
+                    sourceId: sessionId,
+                    payload: {{
+                        userAgent: navigator.userAgent,
+                        platform: navigator.platform,
+                        webrtcSupported: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+                    }},
+                    timestamp: Date.now()
+                }}));
+            }};
+            
+            socket.onclose = () => {{
+                console.log('Disconnected from signaling server');
+                updateStatus('Disconnected from server', 'error');
+            }};
+            
+            socket.onmessage = async (event) => {{
+                try {{
+                    const message = JSON.parse(event.data);
+                    console.log('📨 Received WebSocket message:', message.type, 'for session:', message.sourceId);
+                    console.log('📨 Full message:', message);
+                    
+                    if (message.type === 'session-joined') {{
+                        console.log('✅ Session joined successfully');
+                        updateStatus('Session joined! Ready to start camera', 'connected');
+                    }} else if (message.type === 'error') {{
+                        console.log('❌ Received error message:', message.payload);
+                        updateStatus(`Error: ${{message.payload.error}}`, 'error');
+                    }} else if (message.type === 'offer') {{
+                        console.log('📥 Received offer (unexpected for mobile)');
+                        await handleOffer(message.payload);
+                    }} else if (message.type === 'answer') {{
+                        console.log('📥 Received answer from frontend');
+                        await handleAnswer(message.payload);
+                    }} else if (message.type === 'ice-candidate') {{
+                        console.log('📥 Received ICE candidate');
+                        await handleIceCandidate(message.payload);
+                    }} else {{
+                        console.log('❓ Unknown message type:', message.type);
+                    }}
+                }} catch (error) {{
+                    console.error('❌ Error parsing WebSocket message:', error, 'Raw data:', event.data);
+                }}
+            }};
+            
+            // WebRTC functions
+            async function startCamera() {{
+                try {{
+                    updateStatus('🎥 Starting camera...', 'connecting');
+                    
+                    // Log device info for debugging
+                    console.log('📱 Device info:');
+                    console.log('  User Agent:', navigator.userAgent);
+                    console.log('  Platform:', navigator.platform);
+                    console.log('  WebRTC support:', !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+                    console.log('  Session ID:', sessionId);
+                    
+                    // Try modern getUserMedia first
+                    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {{
+                        // Try with progressive constraint fallback to handle OverconstrainedError
+                        const constraintOptions = [
+                            // First try: High quality with environment camera
+                            {{
+                                video: {{
+                                    facingMode: {{ ideal: 'environment' }},
+                                    width: {{ min: 320, ideal: 1280, max: 1920 }},
+                                    height: {{ min: 240, ideal: 720, max: 1080 }},
+                                    frameRate: {{ min: 15, ideal: 30, max: 60 }}
+                                }},
+                                audio: false
+                            }},
+                            // Second try: Lower quality with environment camera
+                            {{
+                                video: {{
+                                    facingMode: {{ ideal: 'environment' }},
+                                    width: {{ ideal: 640 }},
+                                    height: {{ ideal: 480 }},
+                                    frameRate: {{ ideal: 24 }}
+                                }},
+                                audio: false
+                            }},
+                            // Third try: Any camera with basic constraints
+                            {{
+                                video: {{
+                                    width: {{ ideal: 640 }},
+                                    height: {{ ideal: 480 }}
+                                }},
+                                audio: false
+                            }},
+                            // Final try: Basic video only
+                            {{
+                                video: true,
+                                audio: false
+                            }}
+                        ];
+
+                        let lastError;
+                        for (const constraints of constraintOptions) {{
+                            try {{
+                                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                                console.log('✅ Camera access successful with constraints:', constraints);
+                                break;
+                            }} catch (error) {{
+                                console.warn('❌ Camera constraint failed:', error.name, error.message);
+                                lastError = error;
+                                continue;
+                            }}
+                        }}
+                        
+                        if (!localStream) {{
+                            throw lastError || new Error('Failed to access camera with any constraints');
+                        }}
+                    }} else {{
+                        // Fallback to legacy getUserMedia with flexible constraints
+                        const getUserMedia = navigator.getUserMedia || 
+                                           navigator.webkitGetUserMedia || 
+                                           navigator.mozGetUserMedia || 
+                                           navigator.msGetUserMedia;
+                        
+                        if (!getUserMedia) {{
+                            throw new Error('Camera access not supported by this browser. Please use a modern browser or enable HTTPS.');
+                        }}
+                        
+                        localStream = await new Promise((resolve, reject) => {{
+                            getUserMedia.call(navigator, {{
+                                video: {{
+                                    facingMode: {{ ideal: 'environment' }},
+                                    width: {{ ideal: 640 }},
+                                    height: {{ ideal: 480 }}
+                                }},
+                                audio: false
+                            }}, resolve, reject);
+                        }});
+                    }}
+                    
+                    // Show video preview
+                    const video = document.createElement('video');
+                    video.srcObject = localStream;
+                    video.autoplay = true;
+                    video.playsInline = true;
+                    video.muted = true;
+                    
+                    // Create live indicator
+                    const liveIndicator = document.createElement('div');
+                    liveIndicator.className = 'live-indicator';
+                    liveIndicator.innerHTML = '<div class="live-dot pulse"></div><span>LIVE</span>';
+                    
+                    videoContainer.innerHTML = '';
+                    videoContainer.appendChild(video);
+                    videoContainer.appendChild(liveIndicator);
+                    
+                    // Create peer connection with enhanced debugging
+                    console.log('🔧 Creating RTCPeerConnection with config:', rtcConfig);
+                    peerConnection = new RTCPeerConnection(rtcConfig);
+                    
+                    // Add stream to peer connection
+                    console.log('📹 Adding tracks to peer connection...');
+                    localStream.getTracks().forEach((track, index) => {{
+                        console.log(`📹 Adding track ${{index}}: ${{track.kind}} (${{track.label}})`);
+                        peerConnection.addTrack(track, localStream);
+                    }});
+                    
+                    // Enhanced ICE candidate handling with debugging
+                    peerConnection.onicecandidate = (event) => {{
+                        if (event.candidate) {{
+                            console.log('📡 Sending ICE candidate:', {{
+                                type: event.candidate.type,
+                                protocol: event.candidate.protocol,
+                                address: event.candidate.address,
+                                port: event.candidate.port,
+                                candidate: event.candidate.candidate
+                            }});
+                            socket.send(JSON.stringify({{
+                                type: 'ice-candidate',
+                                sourceId: sessionId,
+                                payload: {{ candidate: event.candidate }},
+                                timestamp: Date.now()
+                            }}));
+                        }} else {{
+                            console.log('📡 ICE gathering complete');
+                        }}
+                    }};
+                    
+                    // Enhanced connection state monitoring
+                    peerConnection.onconnectionstatechange = () => {{
+                        const state = peerConnection.connectionState;
+                        console.log('🔗 Connection state changed:', state);
+                        console.log('🔧 Detailed states:', {{
+                            connectionState: state,
+                            iceConnectionState: peerConnection.iceConnectionState,
+                            iceGatheringState: peerConnection.iceGatheringState,
+                            signalingState: peerConnection.signalingState
+                        }});
+                        
+                        updateStatus(`Connection: ${{state}}`, state === 'connected' ? 'connected' : 'connecting');
+                        
+                        // Android-specific debugging for failed connections
+                        if (state === 'failed') {{
+                            console.error('❌ Connection FAILED - Android debugging info:');
+                            console.error('📱 User Agent:', navigator.userAgent);
+                            console.error('🔧 ICE state:', peerConnection.iceConnectionState);
+                            console.error('🔧 Signaling state:', peerConnection.signalingState);
+                            updateStatus('❌ Connection failed - check console for details', 'error');
+                        }}
+                    }};
+                    
+                    peerConnection.oniceconnectionstatechange = () => {{
+                        const iceState = peerConnection.iceConnectionState;
+                        console.log('🧊 ICE connection state changed:', iceState);
+                        
+                        if (iceState === 'failed' || iceState === 'disconnected') {{
+                            console.error('❌ ICE connection issue detected:', iceState);
+                            console.error('🔧 Attempting to restart ICE...');
+                            
+                            // Attempt ICE restart for Android compatibility
+                            try {{
+                                peerConnection.restartIce();
+                                console.log('🔄 ICE restart initiated');
+                            }} catch (error) {{
+                                console.error('❌ ICE restart failed:', error);
+                            }}
+                        }}
+                    }};
+                    
+                    // Add ICE gathering state monitoring
+                    peerConnection.onicegatheringstatechange = () => {{
+                        console.log('🧊 ICE gathering state:', peerConnection.iceGatheringState);
+                    }};
+                    
+                    // Create and send offer to establish connection
+                    try {{
+                        console.log('📤 Creating offer...');
+                        const offer = await peerConnection.createOffer();
+                        await peerConnection.setLocalDescription(offer);
+                        
+                        console.log('📤 Sending offer to frontend:', offer);
+                        console.log('🔧 ICE gathering state:', peerConnection.iceGatheringState);
+                        console.log('🔧 Connection state:', peerConnection.connectionState);
+                        
+                        socket.send(JSON.stringify({{
+                            type: 'offer',
+                            sourceId: sessionId,
+                            payload: offer,
+                            timestamp: Date.now()
+                        }}));
+                        
+                        updateStatus('📤 Offer sent, waiting for response...', 'connecting');
+                        
+                        // Enhanced timeout monitoring for Android issues
+                        let timeoutCount = 0;
+                        const connectionMonitor = setInterval(() => {{
+                            timeoutCount++;
+                            const states = {{
+                                connection: peerConnection.connectionState,
+                                ice: peerConnection.iceConnectionState,
+                                signaling: peerConnection.signalingState,
+                                gathering: peerConnection.iceGatheringState
+                            }};
+                            
+                            console.log(`⏰ Connection monitor (${{timeoutCount * 2}}s):`, states);
+                            
+                            if (states.connection === 'connected') {{
+                                console.log('✅ Connection successful, clearing monitor');
+                                clearInterval(connectionMonitor);
+                                return;
+                            }}
+                            
+                            if (timeoutCount >= 15) {{ // 30 seconds total
+                                console.error('❌ Connection timeout exceeded (30s)');
+                                console.error('🔧 Final states:', states);
+                                console.error('📱 Device info for debugging:', {{
+                                    userAgent: navigator.userAgent,
+                                    platform: navigator.platform,
+                                    sessionId: sessionId,
+                                    timestamp: new Date().toISOString()
+                                }});
+                                
+                                clearInterval(connectionMonitor);
+                                updateStatus('Connection timeout - check console for details', 'error');
+                                
+                                // Attempt connection retry for Android
+                                if (navigator.userAgent.includes('Android')) {{
+                                    console.log('🔄 Android detected, attempting connection retry...');
+                                    setTimeout(() => {{
+                                        if (peerConnection.connectionState !== 'connected') {{
+                                            console.log('🔄 Retrying connection for Android...');
+                                            stopCamera();
+                                            setTimeout(() => startCamera(), 2000);
+                                        }}
+                                    }}, 3000);
+                                }}
+                            }}
+                        }}, 2000); // Check every 2 seconds
+                    }} catch (error) {{
+                        console.error('❌ Error creating offer:', error);
+                        updateStatus('Failed to create offer', 'error');
+                    }}
+                    
+                    startBtn.style.display = 'none';
+                    stopBtn.style.display = 'inline-block';
+                    isStreaming = true;
+                    
+                    updateStatus('Camera streaming!', 'connected');
+                    
+                }} catch (error) {{
+                    console.error('Error starting camera:', error);
+                    updateStatus(`Camera error: ${{error.message}}`, 'error');
+                }}
+            }}
+            
+            async function handleOffer(offer) {{
+                try {{
+                    await peerConnection.setRemoteDescription(offer);
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    
+                    socket.send(JSON.stringify({{
+                        type: 'answer',
+                        sourceId: sessionId,
+                        payload: answer,
+                        timestamp: Date.now()
+                    }}));
+                }} catch (error) {{
+                    console.error('Error handling offer:', error);
+                }}
+            }}
+            
+            async function handleAnswer(answer) {{
+                try {{
+                    console.log('📥 Received answer from frontend:', answer);
+                    console.log('🔧 Before setRemoteDescription - signaling state:', peerConnection.signalingState);
+                    
+                    await peerConnection.setRemoteDescription(answer);
+                    console.log('✅ Successfully set remote description');
+                    console.log('🔧 After setRemoteDescription - signaling state:', peerConnection.signalingState);
+                    console.log('🔧 Connection state:', peerConnection.connectionState);
+                    console.log('🔧 ICE connection state:', peerConnection.iceConnectionState);
+                    
+                    updateStatus('Connection established!', 'connected');
+                }} catch (error) {{
+                    console.error('❌ Error handling answer:', error);
+                    updateStatus('Failed to handle answer', 'error');
+                }}
+            }}
+            
+            async function handleIceCandidate(candidate) {{
+                try {{
+                    console.log('📥 Received ICE candidate');
+                    await peerConnection.addIceCandidate(candidate.candidate);
+                }} catch (error) {{
+                    console.error('❌ Error handling ICE candidate:', error);
+                }}
+            }}
+            
+            function stopCamera() {{
+                if (localStream) {{
+                    localStream.getTracks().forEach(track => track.stop());
+                    localStream = null;
+                }}
+                
+                if (peerConnection) {{
+                    peerConnection.close();
+                    peerConnection = null;
+                }}
+                
+                videoContainer.innerHTML = '<div class="camera-icon">📹</div>';
+                startBtn.style.display = 'inline-block';
+                stopBtn.style.display = 'none';
+                isStreaming = false;
+                
+                updateStatus('Camera stopped', 'connecting');
+            }}
+            
+            function disconnect() {{
+                stopCamera();
+                socket.close();
+                updateStatus('Disconnected', 'error');
+                window.close();
+            }}
+            
+            // Handle page visibility changes
+            document.addEventListener('visibilitychange', () => {{
+                if (document.hidden && isStreaming) {{
+                    console.log('Page hidden, maintaining connection...');
+                }} else if (!document.hidden && isStreaming) {{
+                    console.log('Page visible, connection active');
+                }}
+            }});
+            
+            // Handle page unload
+            window.addEventListener('beforeunload', () => {{
+                stopCamera();
+                socket.close();
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content)
 
 
 @app.get("/cameras/stream/{camera_identifier}")
